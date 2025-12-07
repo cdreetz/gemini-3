@@ -1,4 +1,8 @@
 import asyncio
+import requests
+import uuid
+import webbrowser
+import threading
 import docker
 import contextlib
 import atexit
@@ -11,6 +15,11 @@ from typing import List, Dict, Any, Optional, Tuple
 import verifiers as vf
 from verifiers.types import State
 from datasets import Dataset
+
+from src.monitor import MonitorHandler, ThreadedHTTPServer
+
+MONITOR_PORT = 8090
+MONITOR_URL = f"http://127.0.0.1:{MONITOR_PORT}"
 
 # --- Docker Utils ---
 
@@ -124,6 +133,30 @@ class DockerEnv(vf.StatefulToolEnv):
         self.timeout = timeout
         self.network_disabled = network_disabled
 
+    def _start_monitor_server(self):
+        """Starts the monitoring web server in a background thread and opens the browser."""
+        
+        server_address = ('', self._monitor_port)
+        self._monitor_server = ThreadedHTTPServer(server_address, MonitorHandler)
+        
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_server.serve_forever,
+            daemon=True
+        )
+        self._monitor_thread.start()
+        
+        monitor_url = f"http://127.0.0.1:{self._monitor_port}/"
+        print(f"\n✨ Live Monitor running at {monitor_url}")
+        
+        # 💡 AUTOMATE BROWSER OPENING
+        # Use open_new_tab to launch the URL in a new browser tab/window
+        try:
+            webbrowser.open_new_tab(monitor_url)
+        except Exception as e:
+            print(f"Warning: Could not automatically open browser. Please navigate to {monitor_url} manually. Error: {e}")
+
+
+
     #################
     # Env Utilities #
     #################
@@ -148,6 +181,7 @@ class DockerEnv(vf.StatefulToolEnv):
         state: State, 
     ) -> State:
         """Initializes container, installs tools, sets up directories, and copies tests."""
+        rollout_id = str(uuid.uuid4())
         
         # 1. Create the container
         container = await create_container(
@@ -156,9 +190,22 @@ class DockerEnv(vf.StatefulToolEnv):
             network_mode="none" if self.network_disabled else "bridge",
             mem_limit="512m"
         )
+
+        #MonitorHandler.ACTIVE_CONTAINER_ID = container.id
         
         state["container"] = container
 
+        try:
+            requests.post(
+                f"{MONITOR_URL}/api/start", 
+                json={"rollout_id": rollout_id, "container_id": container.id},
+                timeout=2
+            )
+        except requests.exceptions.ConnectionError:
+            print(f"WARNING: Monitor server not running at {MONITOR_URL}. Skipping monitoring.")
+        
+        # 4. Store ID in state for teardown
+        state["rollout_id"] = rollout_id
         # 4. Standard Container Setup
         await _exec_setup_cmd(container, "pip install uv pytest")
         await _exec_setup_cmd(container, "mkdir -p /workspace/code /workspace/tests")
@@ -195,13 +242,20 @@ def test_add_function():
         return state
 
     async def teardown_state(self, state: State):
-        """Cleanup handled by AsyncExitStack, this is just a placeholder."""
+        # 1. 💡 API CALL: Notify the monitor server that the rollout has ended
+        rollout_id = state.get("rollout_id")
+        if rollout_id:
+            try:
+                requests.post(f"{MONITOR_URL}/api/end", timeout=2)
+            except requests.exceptions.ConnectionError:
+                pass # Ignore if server is already down
+
+        # 2. Cleanup (as before)
         container = state.get("container")
         if container:
             await stop_container(container)
-
             if container.id in ORPHAN_CONTAINER_TRACKER:
-                ORPHAN_CONTAINER_TRACKER.remove(container.id)
+                 ORPHAN_CONTAINER_TRACKER.remove(container.id)
 
     def update_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "bash":
@@ -289,8 +343,12 @@ def load_environment(
         "prompt": [
             # The prompt guides the LLM on what code to write
             [{"role": "user", "content": "Write a Python function `add(a, b)` and save it to `/workspace/code/main.py` that correctly returns the sum of two numbers. You can only use the `bash` tool."}],
+            [{"role": "user", "content": "Write a Python FastAPI server that servers a hello world endpoint` and save it to `/workspace/code/main.py` that correctly returns the sum of two numbers. You can only use the `bash` tool."}],
         ],
-        "answer": ["The correct implementation of add(a, b) is trivial math."]
+        "answer": [
+            "The correct implementation of add(a, b) is trivial math.",
+            "The correct implementation has a server with a hello_world endpoint"
+        ]
     })
 
     # 3. Instantiate the DockerEnv
