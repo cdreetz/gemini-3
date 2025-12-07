@@ -74,40 +74,56 @@ def sync_exec_in_container(container, command: str) -> Tuple[int, Tuple[bytes, b
         loop.close()
 
 # 3. Core Monitoring Logic (Uses the new synchronous wrapper)
+# 3. Core Monitoring Logic (Uses the stable wrapper)
+# 3. Core Monitoring Logic (Uses the stable wrapper)
 def get_workspace_state_via_bash(container) -> Dict[str, str]:
-    """
-    Reads workspace files by synchronously running bash commands (ls/cat), 
-    which is much faster than container.get_archive().
-    """
-    # 1. Get a list of all files in the workspace directory.
+    """Reads workspace files and directories by synchronously running bash commands."""
+    
+    # 1. Get a list of ALL contents (files and directories) recursively.
     exit_code, (stdout, stderr) = sync_exec_in_container(
         container, 
-        'find /workspace -type f -print' # List all files recursively
+        'find /workspace -mindepth 1 -print' # Use -mindepth 1 to skip /workspace itself
     )
 
     if exit_code != 0:
-        return {"error": f"Failed to list files: {stderr.decode()}"}
+        return {"error": f"Failed to list contents (Exit {exit_code}). STDOUT: {stdout.decode()}, STDERR: {stderr.decode()}"}
 
-    file_list = stdout.decode().strip().split('\n')
+    # Clean the list of paths
+    full_path_list = [p.strip() for p in stdout.decode().split('\n') if p.strip()]
     file_map = {}
 
-    # 2. CAT each file to get its content (fast operation)
-    for file_path in file_list:
-        if not file_path:
+    # 2. Process each path, checking if it's a file or a directory before reading
+    for full_path in full_path_list:
+        if not full_path or full_path == "/workspace":
             continue
             
-        # Cat the file content
-        exit_code, (content, _) = sync_exec_in_container(
+        # Keys are relative paths
+        relative_path = full_path.replace('/workspace/', '', 1) 
+
+        # A. Check if the path is a regular file using bash 'test -f'
+        # This is the key difference and provides reliable type checking.
+        is_file_exit_code, _ = sync_exec_in_container(
             container, 
-            f'cat {file_path}'
+            f'test -f {full_path}'
         )
         
-        if exit_code == 0:
-            # Keys are relative paths (e.g., 'code/main.py')
-            file_map[file_path.replace('/workspace/', '')] = content.decode('utf-8', errors='ignore')
-        else:
-            file_map[file_path.replace('/workspace/', '')] = "[ERROR READING FILE]"
+        if is_file_exit_code == 0:
+            # It is a regular file, so read its contents
+            exit_code, (content, _) = sync_exec_in_container(
+                container, 
+                f'cat {full_path}'
+            )
+            
+            if exit_code == 0:
+                file_map[relative_path] = content.decode('utf-8', errors='ignore')
+            else:
+                file_map[relative_path] = f"[ERROR READING FILE: cat exit {exit_code}]"
 
+        else:
+            # It is not a regular file (i.e., it's a directory or link/other)
+            # Use the directory placeholder
+            file_map[relative_path] = "[[DIRECTORY]]"
+            
     return file_map
 
 

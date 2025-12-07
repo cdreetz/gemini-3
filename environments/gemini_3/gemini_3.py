@@ -126,12 +126,15 @@ class DockerEnv(vf.StatefulToolEnv):
         image: str = "python:3.11-slim",
         timeout: int = 30,
         network_disabled: bool = False, # Safer default for code execution
+        system_prompt: Optional[str] = None,
+        **kwargs
     ):
-        super().__init__(dataset=dataset, rubric=rubric)
+        super().__init__(dataset=dataset, rubric=rubric, system_prompt=system_prompt, **kwargs)
         self.client = docker.from_env()
         self.image = image
         self.timeout = timeout
         self.network_disabled = network_disabled
+        self.add_tool(self.bash, args_to_skip=[])
 
     def _start_monitor_server(self):
         """Starts the monitoring web server in a background thread and opens the browser."""
@@ -210,34 +213,6 @@ class DockerEnv(vf.StatefulToolEnv):
         await _exec_setup_cmd(container, "pip install uv pytest")
         await _exec_setup_cmd(container, "mkdir -p /workspace/code /workspace/tests")
         
-        # 5. Copy a challenge test file (e.g., test for a simple addition function)
-        TEST_CONTENT = """
-import pytest
-import sys
-# Add code directory to path so the agent's code can be imported
-sys.path.append('/workspace/code') 
-try:
-    from main import add
-except ImportError:
-    # Define a dummy function to prevent crash if agent hasn't written code yet
-    def add(a, b): return a + b # Will fail test cases if this is the actual code
-
-def test_add_function():
-    # This test will fail if the agent does not define a correct 'add' function 
-    # in /workspace/code/main.py
-    assert add(2, 3) == 5
-    assert add(10, -5) == 5
-"""
-        # Note: self._copy_to_container is synchronous, so we run it directly
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, 
-            lambda: self._copy_to_container(
-                container, 
-                "/workspace/tests/test_main.py", 
-                TEST_CONTENT
-            )
-        )
 
         return state
 
@@ -257,17 +232,26 @@ def test_add_function():
             if container.id in ORPHAN_CONTAINER_TRACKER:
                  ORPHAN_CONTAINER_TRACKER.remove(container.id)
 
-    def update_tool_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def update_tool_args(
+        self, 
+        tool_name: str, 
+        tool_args: Dict[str, Any],
+        messages: List[Dict[str, str]],
+        state: State,
+        **kwargs
+    ) -> Dict[str, Any]:
         if tool_name == "bash":
-            pass
-
-        return args
+            updated_args = dict(tool_args)
+            updated_args["state"] = state
+            return updated_args
+        else:
+            return tool_args
         
     ##########
     # Tools ##
     ##########
 
-    async def bash(self, command: str, state: State) -> str:
+    async def bash(self, command: str, state: str) -> str:
         """
         Execute a bash command inside the rollouts assigned container.
         
@@ -299,30 +283,71 @@ def test_add_function():
 
 async def test_execution_reward(completion: str, state: State, **kwargs) -> float:
     """
-    A reward function that runs the tests in the container and awards 1.0 for success.
-    
-    This function is called by the Rubric at the end of the rollout.
-    It expects the LLM agent to have used the 'bash' tool to write its code 
-    to /workspace/code/main.py.
+    A reward function that runs the tests written by the agent in the container.
+    It awards 1.0 for success (Exit Code 0).
     """
     container = state.get("container")
     if not container:
         return 0.0 # Cannot run tests
 
-    # Command to run tests: uv run pytest /workspace/tests/test_main.py
+    # 💡 CRITICAL: Command to run the agent's self-written tests
     exit_code, (stdout, stderr) = await execute_in_container(
         container, 
-        "uv run pytest /workspace/tests/test_main.py",
+        "uv run pytest /workspace/tests/test_solution.py",
         timeout=10 # Short timeout for test execution
     )
 
     # For training/evaluation, we want explicit pass/fail
     if exit_code == 0:
-        return 1.0 # Tests passed
+        return 1.0 # Tests passed (meaning agent completed both code and tests)
     else:
         # Optionally, you can log the output for debugging:
         # print(f"Tests failed. STDOUT: {stdout.decode()}, STDERR: {stderr.decode()}")
         return 0.0 # Tests failed or execution error
+
+
+SYSTEM_PROMPT = """
+... (initial setup remains the same) ...
+
+### 📂 Required File Structure and Paths
+You must create and modify these two specific files.
+
+| Path | Purpose | Constraint |
+| :--- | :--- | :--- |
+| **`/workspace/code/solution.py`** | **This is where all your solution logic MUST reside.** | **Write all final code here.** |
+| **`/workspace/tests/test_solution.py`** | **This is where your unit tests MUST reside.** These tests define your success and will be executed for the final reward. | **Write all tests here.** |
+
+... (Tool definition remains the same) ...
+
+Example Strategy and Usage (CRITICAL):
+
+1.  **Write Code:** Implement your solution:
+
+    ```bash
+    echo 'def add(a, b):\n    return a + b' > /workspace/code/solution.py
+    ```
+
+2.  **Write Tests:** Create a test file that imports and tests your solution:
+
+    ```bash
+    echo 'import sys' > /workspace/tests/test_solution.py
+    echo 'sys.path.append("/workspace/code")' >> /workspace/tests/test_solution.py
+    echo 'from solution import add' >> /workspace/tests/test_solution.py
+    echo 'def test_add_works():' >> /workspace/tests/test_solution.py
+    echo '    assert add(2, 3) == 5' >> /workspace/tests/test_solution.py
+    ```
+    *Note: The sys.path.append is crucial for the tests to find your code.*
+
+3.  **Verify:** Run the tests to confirm your implementation is correct and your tests are passing:
+
+    ```bash
+    uv run pytest /workspace/tests/test_solution.py
+    ```
+
+Make sure to write both the code and the tests.
+Continue making tool calls until everythinh is done.
+
+"""
 
 def load_environment(
     image: str = "python:3.11-slim",
@@ -356,6 +381,7 @@ def load_environment(
         dataset=dataset,
         rubric=rubric,
         image=image,
+        system_prompt=SYSTEM_PROMPT,
         **kwargs
     )
     
